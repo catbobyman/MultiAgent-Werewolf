@@ -27,9 +27,12 @@ log_file_level = "INFO"
 markers = [
     "slow: slow tests",
     "skip_when_ci: Skip when CI/CD",
+    "fleet_smoke: opt-in fleet smoke tests (real subprocesses; set RUN_FLEET_SMOKE=1)",
 ]
 minversion = "8.2"
 testpaths = "tests/"
+# tests/interface: conftest imports `tests.interface.fixtures` (see tests/__init__.py)
+pythonpath = ["src", "tests"]
 python_files = "test_*.py"
 cache_dir = "~/.cache/pytest"
 asyncio_mode = "auto"
@@ -53,7 +56,22 @@ directory = "./.github/coverage_html_report"
 
 [tool.coverage.run]
 data_file = './.github/reports/.coverage'
-omit = ["*/__init__.py"]
+omit = [
+    "*/__init__.py",
+    "*/ui/components/*",
+    "*/agent_team/agents/human_interactive_agent.py",
+    "*/agent_team/memory/memory_manager.py",
+    "*/evaluation/post_game/eval_agent.py",
+    "*/evaluation/post_game/replay_agent.py",
+    "*/evaluation/post_game/skill_generation/mock_integration_skills.py",
+    "*/interface/cli/entry.py",
+    "*/interface/cli.py",
+    "*/interface/*_cli.py",
+    "*/interface/cli_overrides.py",
+    "*/interface/finalize_run.py",
+    "*/interface/player_count.py",
+    "*/interface/modes.py",
+]
 
 # ================== #
 #        uv          #
@@ -62,17 +80,18 @@ omit = ["*/__init__.py"]
 [project]
 name = "llm_werewolf"
 version = "0.1.0"
-description = "AI-powered Werewolf game with LLM integration and TUI interface"
+description = "AI-powered Werewolf game with LLM integration, CLI, and frontend interfaces"
 dependencies = [
+    "agentscope>=1.0.20",
     "fire>=0.7.1",
     "logfire>=4.27.0",
     "openai>=2.26.0",
     "pydantic>=2.12.5",
-    "pydantic-settings>=2.13.1",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
     "rich>=14.3.3",
-    "textual>=8.0.2",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
 ]
 readme = "README.md"
 requires-python = ">= 3.10"
@@ -82,11 +101,14 @@ license = { text = "MIT" }
 Repository = "https://github.com/kissie-77/MultiAgent-Werewolf"
 
 [project.scripts]
-llm-werewolf = "llm_werewolf.cli:entry"
-llm-werewolf-tui = "llm_werewolf.tui:entry"
-werewolf = "llm_werewolf.cli:entry"
-werewolf-tui = "llm_werewolf.tui:entry"
-werewolf-eval = "llm_werewolf.eval_cli:entry"
+llm-werewolf = "llm_werewolf.interface.cli.entry:entry"
+werewolf = "llm_werewolf.interface.cli.entry:entry"
+werewolf-eval = "llm_werewolf.interface.cli.eval:entry"
+werewolf-evidence = "llm_werewolf.interface.cli.evidence:entry"
+werewolf-vote-swing = "llm_werewolf.interface.cli.vote_swing:entry"
+werewolf-watch = "llm_werewolf.interface.cli.watch:entry"
+werewolf-api = "llm_werewolf.interface.api.app:main"
+werewolf-fleet = "llm_werewolf.interface.cli.fleet.entry:entry"
 
 [dependency-groups]
 dev = [
@@ -95,9 +117,11 @@ dev = [
     "notebook",
     "poethepoet",
     "pre-commit",
+    "ruff",
     "ty",
 ]
 test = [
+    "agentscope>=1.0.20",
     "genbadge[all]",
     "pytest",
     "pytest-asyncio",
@@ -169,19 +193,28 @@ exclude = [
 ]
 
 [tool.poe.tasks]
-# Run game in console mode (auto-play)
-cli = "python ./src/llm_werewolf/cli.py"
-main = "python ./src/llm_werewolf/cli.py"
+# ── 游戏入口 ──────────────────────────────────────────────────────────────
+cli  = "python -m llm_werewolf.interface.cli"
+main = "python -m llm_werewolf.interface.cli"
+demo = { shell = "python -m llm_werewolf.interface.cli --config configs/demo-6.yaml" }
+api  = { shell = "python -m llm_werewolf.interface.api.app" }
 
-# Run game in TUI mode (interactive)
-tui = "python ./src/llm_werewolf/tui.py"
+# ── 测试 ──────────────────────────────────────────────────────────────────
+# 完整测试（含覆盖率，与 CI 保持一致）
+test = { shell = "pytest" }
+# 快速测试（不计覆盖率，适合本地迭代）
+test-fast = { shell = "pytest --override-ini='addopts=' --ignore=tests/scripts -q -n auto --tb=short" }
 
-# Documentation
-docs_gen = "make gen-docs"
-docs_deploy = "mkdocs gh-deploy --force --clean"
-docs_run = "mkdocs serve"
-gen = ["docs_gen", "docs_deploy"]
-docs = ["docs_gen", "docs_run"]
+# ── 代码质量 ──────────────────────────────────────────────────────────────
+lint  = { shell = "ruff check src/ tests/" }
+fmt   = { shell = "ruff format src/ tests/ && ruff check --fix src/ tests/" }
+check = { sequence = ["lint", "test-fast"] }
+
+# ── 环境初始化 ────────────────────────────────────────────────────────────
+# 仅安装开发 + 测试依赖（不含 docs），等价于 make install
+install = { shell = "uv sync --group dev --group test" }
+# 安装所有依赖组
+install-all = { shell = "uv sync --all-groups" }
 
 # https://docs.astral.sh/uv/reference/settings
 [tool.uv]
@@ -227,7 +260,7 @@ preview = true
 
 # Enable Auto Fixing.
 fix = true
-unsafe-fixes = true
+unsafe-fixes = false
 
 # Whether to automatically exclude files that are ignored by .ignore, .gitignore, .git/info/exclude, and global gitignore files. Enabled by default.
 respect-gitignore = true
@@ -371,6 +404,8 @@ ignore = [
     "PERF401",
     # Use `list` or `list.copy` to create a copy of a list
     "PERF402",
+    # try-except inside a loop (necessary for retry-with-backoff loops)
+    "PERF203",
     # constants ("magic") values in comparisons
     "PLR2004",
 ]
@@ -398,7 +433,10 @@ keep-runtime-typing = true
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "D104"]
 "*.ipynb" = ["T201", "F401", "S105", "F811", "ANN", "PERF", "SLF"]
-"tests/*" = ["S101", "SLF001"]
+"tests/**/*.py" = ["S101", "SLF001", "INP001", "ANN", "PLC0415", "PT011", "ARG"]
+"scripts/**/*.py" = ["INP001", "E402", "T201", "ANN401", "S101", "SLF001", "PLC0415"]
+# Fleet CLI prints status tables to the console (like scripts), so allow `print`.
+"*/interface/cli/fleet/entry.py" = ["T201"]
 "notebooks/*.ipynb" = ["UP", "DOC", "RUF", "D", "C", "F401", "T201"]
 "examples/*.py" = ["UP", "DOC", "RUF", "D", "C", "F401", "T201"]
 
@@ -671,7 +709,7 @@ skip = "pyproject.toml,poetry.lock,notebook/.*,uv.lock"
 count = false
 quiet-level = 3
 # the correct one is Amoeba, but we use pronunciation in Chinese to name it.
-ignore-words-list = ["ameba", "mke"]
+ignore-words-list = ["ameba", "mke", "strat"]
 
 
 # ================== #

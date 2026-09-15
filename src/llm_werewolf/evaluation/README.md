@@ -2,6 +2,10 @@
 
 这个组件用于离线评测狼人杀游戏系统本身的正确性，优先检查角色技能、信息隔离、胜负判定和异步阶段流程。它默认使用 `DemoAgent`，不需要真实模型 API key。
 
+对局结束后会自动跑 **PostGame**（`evaluation/post_game/`）：阵营匹配说服分析、**情景记忆 episode 导出**（`episodic_reports.json`，与 `agent_team.memory.EpisodicMemory` 同源）、Prompt 提案 JSON、**Skill 提取（MD + JSON）**、`coach_summary.json`（为 Skill 附加 POV episode 证据）。真实 LLM 对局由 `interface/finalize_run.py` 触发；批量 eval 默认 `skip_llm=True`。
+
+赛后 LLM 提示词外置在 `evaluation/prompts/`（`replay/v1`、`coach/v1`），由 `evaluation/registry/post_game_prompt_registry.py` 加载；进化产物可写入 `artifacts/prompt_post_game/`。
+
 ## 运行方式
 
 运行 6 人基础 smoke 评测：
@@ -26,9 +30,9 @@ uv run --with "pytest>=8.2" pytest -o addopts='' tests/evaluation -q
 
 ## 内置场景
 
-| Scenario | 用途 |
-| --- | --- |
-| `smoke_6p_basic` | 6 人基础局，覆盖狼人、预言家、女巫、村民等核心流程。 |
+| Scenario                  | 用途                                                              |
+| ------------------------- | ----------------------------------------------------------------- |
+| `smoke_6p_basic`          | 6 人基础局，覆盖狼人、预言家、女巫、村民等核心流程。              |
 | `regression_default_demo` | 16 人默认角色配置，用于捕获复杂配置中的阶段、角色和事件结构问题。 |
 
 ## 输出产物
@@ -39,6 +43,8 @@ uv run --with "pytest>=8.2" pytest -o addopts='' tests/evaluation -q
 eval_runs/<run-name>/
   manifest.json
   summary.json
+  experiment_meta.json
+  leaderboard_entry.json
   metrics.csv
   report.md
   games/<game_id>/events.jsonl
@@ -54,40 +60,42 @@ eval_runs/<run-name>/
 - `checks.json`：每局 checker 结果。
 - `errors.jsonl`：崩溃、超时或 observation 构建异常。
 - `summary.json`：机器可读的汇总指标。
+- `experiment_meta.json`：该次实验的版本元信息，以及上一版 skill 快照来源。
+- `leaderboard_entry.json`：用于 leaderboard / A-B 对比的一次实验汇总条目。
 - `metrics.csv`：表格格式指标。
 - `report.md`：人类可读报告。
 
 ## 当前 Checkers
 
-| Checker | 检查内容 |
-| --- | --- |
-| `RoleSkillChecker` | 角色动作事件是否具备必要结构化字段，如 `target_id`、`result`。 |
-| `InformationIsolationChecker` | 私有事件是否泄露到无权限玩家的 observation。 |
-| `VictoryCheckerEvaluator` | `GAME_ENDED` 事件里的 winner 是否和最终 game state 一致。 |
-| `AsyncFlowChecker` | 阶段流转是否符合 setup/night/day/voting/ended 的允许顺序。 |
-| `RuntimeErrorEventChecker` | 将游戏过程中记录的 `EventType.ERROR` 归入评测失败项。 |
+| Checker                       | 检查内容                                                       |
+| ----------------------------- | -------------------------------------------------------------- |
+| `RoleSkillChecker`            | 角色动作事件是否具备必要结构化字段，如 `target_id`、`result`。 |
+| `InformationIsolationChecker` | 私有事件是否泄露到无权限玩家的 observation。                   |
+| `VictoryCheckerEvaluator`     | `GAME_ENDED` 事件里的 winner 是否和最终 game state 一致。      |
+| `AsyncFlowChecker`            | 阶段流转是否符合 setup/night/day/voting/ended 的允许顺序。     |
+| `RuntimeErrorEventChecker`    | 将游戏过程中记录的 `EventType.ERROR` 归入评测失败项。          |
 
 ## 当前 Metrics
 
-| Metric | 含义 |
-| --- | --- |
-| `total_games` | 总评测局数。 |
-| `completed_games` | 成功结束并产生 winner 的局数。 |
-| `completion_rate` | 完成率。 |
-| `crashed_games` | 抛出未处理异常的局数。 |
-| `crash_rate` | 崩溃率。 |
-| `timeout_games` | 单局超过 `timeout_seconds` 的局数。 |
-| `timeout_rate` | 超时率。 |
-| `avg_rounds_per_game` | 平均游戏轮数。 |
-| `role_skill_violation_count` | 角色技能/动作事件结构违规数。 |
-| `information_leak_count` | 信息隔离违规数。 |
-| `victory_rule_violation_count` | 胜负判定一致性违规数。 |
-| `phase_order_violation_count` | 阶段流转违规数。 |
-| `invalid_action_count` | 预留的非法动作计数；当前第一版尚未由 checker 写入。 |
-| `exception_count_by_role` | 按角色聚合的运行时错误数。 |
-| `exception_count_by_phase` | 按阶段聚合的运行时错误数。 |
-| `missing_structured_event_count` | 缺少结构化字段的事件数。 |
-| `top_errors` | 最高频错误或违规摘要。 |
+| Metric                           | 含义                                                |
+| -------------------------------- | --------------------------------------------------- |
+| `total_games`                    | 总评测局数。                                        |
+| `completed_games`                | 成功结束并产生 winner 的局数。                      |
+| `completion_rate`                | 完成率。                                            |
+| `crashed_games`                  | 抛出未处理异常的局数。                              |
+| `crash_rate`                     | 崩溃率。                                            |
+| `timeout_games`                  | 单局超过 `timeout_seconds` 的局数。                 |
+| `timeout_rate`                   | 超时率。                                            |
+| `avg_rounds_per_game`            | 平均游戏轮数。                                      |
+| `role_skill_violation_count`     | 角色技能/动作事件结构违规数。                       |
+| `information_leak_count`         | 信息隔离违规数。                                    |
+| `victory_rule_violation_count`   | 胜负判定一致性违规数。                              |
+| `phase_order_violation_count`    | 阶段流转违规数。                                    |
+| `invalid_action_count`           | 预留的非法动作计数；当前第一版尚未由 checker 写入。 |
+| `exception_count_by_role`        | 按角色聚合的运行时错误数。                          |
+| `exception_count_by_phase`       | 按阶段聚合的运行时错误数。                          |
+| `missing_structured_event_count` | 缺少结构化字段的事件数。                            |
+| `top_errors`                     | 最高频错误或违规摘要。                              |
 
 ## 当前限制
 
