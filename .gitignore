@@ -278,4 +278,9 @@ frontend/.env.*.local
 
 # Editor / local scratch
 .cursor/
+# Keep repo-managed Cloud Agent environment config tracked
+!.cursor/
+.cursor/*
+!.cursor/environment.json
+!.cursor/install.sh
 conflict-files.txt

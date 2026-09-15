@@ -1,0 +1,21 @@
+{
+  "name": "MultiAgent-Werewolf",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "backend-api",
+      "command": "export PATH=\"$HOME/.local/bin:$PATH\"; OBS_READY_REQUIRE_LLM=0 PYTHONPATH=src uv run werewolf-api --port 8010",
+      "description": "FastAPI backend (werewolf-api) on http://localhost:8010"
+    },
+    {
+      "name": "frontend-web",
+      "command": "cd frontend && npm run dev -- --host",
+      "description": "Vite React dev server on http://localhost:5173 (proxies /api and /ready to :8010)"
+    }
+  ],
+  "ports": [
+    {"name": "backend-api", "port": 8010},
+    {"name": "frontend-web", "port": 5173}
+  ]
+}
