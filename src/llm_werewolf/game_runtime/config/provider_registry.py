@@ -1,0 +1,482 @@
+"""Canonical LLM provider definitions for env templates and roster resolution.
+
+Each provider maps to a small, fixed set of environment variables (never per-seat).
+Standard boards default to ``doubao``; mixed-model matches override seats at
+``POST /games/start`` using these ``provider_id`` values.
+
+Env naming convention
+---------------------
+* ``*_API_KEY``  — secret (required to call the provider)
+* ``*_MODEL``    — model or deployment id (optional when a sensible default exists)
+* ``*_BASE_URL`` — OpenAI-compatible API root (optional; registry supplies default)
+* Doubao uses legacy names ``ARK_API_KEY`` / ``ARK_EP`` (already in standard YAML)
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ProviderEnvField:
+    """One ``.env`` variable belonging to a provider."""
+
+    env_name: str
+    label: str
+    required: bool = True
+    secret: bool = True
+    example: str = ""
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Static metadata for a supported vendor."""
+
+    provider_id: str
+    display_name: str
+    env_fields: tuple[ProviderEnvField, ...]
+    default_base_url: str
+    default_model: str | None = None
+    notes: str = ""
+
+    @property
+    def api_key_env(self) -> str:
+        for field in self.env_fields:
+            if field.secret and field.required:
+                return field.env_name
+        return self.env_fields[0].env_name
+
+    @property
+    def model_env(self) -> str | None:
+        for field in self.env_fields:
+            if field.secret:
+                continue
+            if "MODEL" in field.env_name or field.env_name.endswith("_EP"):
+                return field.env_name
+        return None
+
+
+# provider_id → spec (order = UI / .env.example section order)
+PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
+    "doubao": ProviderSpec(
+        provider_id="doubao",
+        display_name="豆包 (Volcengine Ark)",
+        env_fields=(
+            ProviderEnvField(
+                env_name="ARK_API_KEY",
+                label="API Key",
+                example="your_ark_api_key_here",
+                description="火山方舟控制台 API Key；标准对局默认供应商",
+            ),
+            ProviderEnvField(
+                env_name="ARK_EP",
+                label="Endpoint ID",
+                secret=False,
+                example="ep-xxxxxxxxxx-yyyy",
+                description="推理接入点 ID（model_env）；非 Key 本身",
+            ),
+            ProviderEnvField(
+                env_name="ARK_EP_DISPLAY",
+                label="展示名称",
+                required=False,
+                secret=False,
+                example="豆包 Seed 1.6 极速版",
+                description="开局界面显示用，避免直接展示 ep- 编号",
+            ),
+        ),
+        default_base_url="https://ark.cn-beijing.volces.com/api/v3",
+        default_model=None,
+        notes="标准 ``standard-*p.yaml`` 使用 ``model_env: ARK_EP``。",
+    ),
+    "deepseek": ProviderSpec(
+        provider_id="deepseek",
+        display_name="DeepSeek",
+        env_fields=(
+            ProviderEnvField(
+                env_name="DEEPSEEK_API_KEY",
+                label="API Key",
+                example="sk-xxxxxxxx",
+            ),
+            ProviderEnvField(
+                env_name="DEEPSEEK_MODEL",
+                label="Model",
+                required=False,
+                secret=False,
+                example="deepseek-v4-flash",
+                description="留空则使用默认模型",
+            ),
+            ProviderEnvField(
+                env_name="DEEPSEEK_MODEL_DISPLAY",
+                label="展示名称",
+                required=False,
+                secret=False,
+                example="DeepSeek V4 Flash",
+            ),
+        ),
+        default_base_url="https://api.deepseek.com/v1",
+        default_model="deepseek-v4-flash",
+    ),
+    "openai": ProviderSpec(
+        provider_id="openai",
+        display_name="OpenAI (GPT)",
+        env_fields=(
+            ProviderEnvField(
+                env_name="OPENAI_API_KEY",
+                label="API Key",
+                example="sk-xxxxxxxx",
+            ),
+            ProviderEnvField(
+                env_name="OPENAI_MODEL",
+                label="Model",
+                required=False,
+                secret=False,
+                example="gpt-4o",
+            ),
+            ProviderEnvField(
+                env_name="OPENAI_MODEL_DISPLAY",
+                label="展示名称",
+                required=False,
+                secret=False,
+                example="GPT-4o",
+            ),
+        ),
+        default_base_url="https://api.openai.com/v1",
+        default_model="gpt-4o",
+    ),
+    "gemini": ProviderSpec(
+        provider_id="gemini",
+        display_name="Google Gemini",
+        env_fields=(
+            ProviderEnvField(
+                env_name="GEMINI_API_KEY",
+                label="API Key",
+                example="AIzaxxxxxxxx",
+            ),
+            ProviderEnvField(
+                env_name="GEMINI_MODEL",
+                label="Model",
+                required=False,
+                secret=False,
+                example="gemini-2.0-flash",
+            ),
+            ProviderEnvField(
+                env_name="GEMINI_MODEL_DISPLAY",
+                label="展示名称",
+                required=False,
+                secret=False,
+                example="Gemini 2.0 Flash",
+            ),
+        ),
+        default_base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        default_model="gemini-2.0-flash",
+    ),
+    "claude": ProviderSpec(
+        provider_id="claude",
+        display_name="Anthropic Claude",
+        env_fields=(
+            ProviderEnvField(
+                env_name="ANTHROPIC_API_KEY",
+                label="API Key",
+                example="sk-ant-xxxxxxxx",
+            ),
+            ProviderEnvField(
+                env_name="ANTHROPIC_MODEL",
+                label="Model",
+                required=False,
+                secret=False,
+                example="claude-sonnet-4-20250514",
+            ),
+            ProviderEnvField(
+                env_name="ANTHROPIC_MODEL_DISPLAY",
+                label="展示名称",
+                required=False,
+                secret=False,
+                example="Claude Sonnet 4",
+            ),
+        ),
+        default_base_url="https://api.anthropic.com/v1",
+        default_model="claude-sonnet-4-20250514",
+    ),
+    "kimi": ProviderSpec(
+        provider_id="kimi",
+        display_name="Kimi (Moonshot)",
+        env_fields=(
+            ProviderEnvField(
+                env_name="KIMI_API_KEY",
+                label="API Key",
+                example="sk-xxxxxxxx",
+                description="Moonshot 官方 Key；VibeAPI 代理可填其 Key 并改 KIMI_BASE_URL",
+            ),
+            ProviderEnvField(
+                env_name="KIMI_BASE_URL",
+                label="Base URL",
+                required=False,
+                secret=False,
+                example="https://api.moonshot.cn/v1",
+                description="代理可用 https://www.vibeapi.cn/v1",
+            ),
+            ProviderEnvField(
+                env_name="KIMI_MODEL",
+                label="Model",
+                required=False,
+                secret=False,
+                example="kimi-k2.5",
+            ),
+            ProviderEnvField(
+                env_name="KIMI_MODEL_DISPLAY",
+                label="展示名称",
+                required=False,
+                secret=False,
+                example="Kimi K2.5",
+            ),
+        ),
+        default_base_url="https://api.moonshot.cn/v1",
+        default_model="kimi-k2.5",
+        notes="历史配置使用 VIBE_API_KEY；新模板统一为 KIMI_*，迁移时二选一即可。",
+    ),
+    "glm": ProviderSpec(
+        provider_id="glm",
+        display_name="智谱 GLM",
+        env_fields=(
+            ProviderEnvField(
+                env_name="GLM_API_KEY",
+                label="API Key",
+                example="xxxxxxxx.xxxxxxxx",
+            ),
+            ProviderEnvField(
+                env_name="GLM_MODEL",
+                label="Model",
+                required=False,
+                secret=False,
+                example="glm-4-flash",
+            ),
+            ProviderEnvField(
+                env_name="GLM_MODEL_DISPLAY",
+                label="展示名称",
+                required=False,
+                secret=False,
+                example="GLM-4 Flash",
+            ),
+        ),
+        default_base_url="https://open.bigmodel.cn/api/paas/v4",
+        default_model="glm-4-flash",
+    ),
+    "minimax": ProviderSpec(
+        provider_id="minimax",
+        display_name="MiniMax",
+        env_fields=(
+            ProviderEnvField(
+                env_name="MINIMAX_API_KEY",
+                label="API Key",
+                example="eyJhbGciOi...",
+            ),
+            ProviderEnvField(
+                env_name="MINIMAX_GROUP_ID",
+                label="Group ID",
+                secret=False,
+                example="1234567890",
+                description="MiniMax 开放平台 Group Id",
+            ),
+            ProviderEnvField(
+                env_name="MINIMAX_MODEL",
+                label="Model",
+                required=False,
+                secret=False,
+                example="abab6.5s-chat",
+            ),
+            ProviderEnvField(
+                env_name="MINIMAX_MODEL_DISPLAY",
+                label="展示名称",
+                required=False,
+                secret=False,
+                example="MiniMax abab6.5s",
+            ),
+        ),
+        default_base_url="https://api.minimaxi.com/v1",
+        default_model="abab6.5s-chat",
+    ),
+    # --- SiliconFlow aggregator: 6 models behind ONE key (SILICONFLOW_API_KEY) ---
+    # Each model is registered as its own provider_id so it appears as a distinct
+    # entry in the per-seat model picker; they all share the same key + base_url
+    # and differ only by ``default_model`` (the SiliconFlow model string).
+    "sf-deepseek": ProviderSpec(
+        provider_id="sf-deepseek",
+        display_name="SiliconFlow",
+        env_fields=(
+            ProviderEnvField(
+                env_name="SILICONFLOW_API_KEY",
+                label="API Key",
+                example="sk-xxxxxxxx",
+                description="SiliconFlow 聚合接口 Key；多个 SF 模型共用同一把",
+            ),
+        ),
+        default_base_url="https://api.siliconflow.cn/v1",
+        default_model="deepseek-ai/DeepSeek-V4-Flash",
+    ),
+    "sf-kimi": ProviderSpec(
+        provider_id="sf-kimi",
+        display_name="SiliconFlow",
+        env_fields=(
+            ProviderEnvField(
+                env_name="SILICONFLOW_API_KEY",
+                label="API Key",
+                example="sk-xxxxxxxx",
+                description="SiliconFlow 聚合接口 Key；多个 SF 模型共用同一把",
+            ),
+        ),
+        default_base_url="https://api.siliconflow.cn/v1",
+        default_model="Pro/moonshotai/Kimi-K2.6",
+    ),
+    "sf-glm": ProviderSpec(
+        provider_id="sf-glm",
+        display_name="SiliconFlow",
+        env_fields=(
+            ProviderEnvField(
+                env_name="SILICONFLOW_API_KEY",
+                label="API Key",
+                example="sk-xxxxxxxx",
+                description="SiliconFlow 聚合接口 Key；多个 SF 模型共用同一把",
+            ),
+        ),
+        default_base_url="https://api.siliconflow.cn/v1",
+        default_model="Pro/zai-org/GLM-5.1",
+    ),
+    "sf-nex": ProviderSpec(
+        provider_id="sf-nex",
+        display_name="SiliconFlow",
+        env_fields=(
+            ProviderEnvField(
+                env_name="SILICONFLOW_API_KEY",
+                label="API Key",
+                example="sk-xxxxxxxx",
+                description="SiliconFlow 聚合接口 Key；多个 SF 模型共用同一把",
+            ),
+        ),
+        default_base_url="https://api.siliconflow.cn/v1",
+        default_model="nex-agi/Nex-N2-Pro",
+    ),
+    "sf-minimax": ProviderSpec(
+        provider_id="sf-minimax",
+        display_name="SiliconFlow",
+        env_fields=(
+            ProviderEnvField(
+                env_name="SILICONFLOW_API_KEY",
+                label="API Key",
+                example="sk-xxxxxxxx",
+                description="SiliconFlow 聚合接口 Key；多个 SF 模型共用同一把",
+            ),
+        ),
+        default_base_url="https://api.siliconflow.cn/v1",
+        default_model="Pro/MiniMaxAI/MiniMax-M2.5",
+    ),
+    "sf-qwen": ProviderSpec(
+        provider_id="sf-qwen",
+        display_name="SiliconFlow",
+        env_fields=(
+            ProviderEnvField(
+                env_name="SILICONFLOW_API_KEY",
+                label="API Key",
+                example="sk-xxxxxxxx",
+                description="SiliconFlow 聚合接口 Key；多个 SF 模型共用同一把",
+            ),
+        ),
+        default_base_url="https://api.siliconflow.cn/v1",
+        default_model="Qwen/Qwen3.5-397B-A17B",
+    ),
+}
+
+DEFAULT_PROVIDER_ID = "doubao"
+
+SUPPORTED_PROVIDER_IDS: tuple[str, ...] = tuple(PROVIDER_REGISTRY.keys())
+
+
+def get_provider(provider_id: str) -> ProviderSpec:
+    spec = PROVIDER_REGISTRY.get(provider_id)
+    if spec is None:
+        supported = ", ".join(SUPPORTED_PROVIDER_IDS)
+        msg = f"Unknown provider_id {provider_id!r}; supported: {supported}"
+        raise ValueError(msg)
+    return spec
+
+
+def all_env_var_names() -> frozenset[str]:
+    names: set[str] = set()
+    for spec in PROVIDER_REGISTRY.values():
+        for field in spec.env_fields:
+            names.add(field.env_name)
+    return frozenset(names)
+
+
+def model_display_env_name(model_env: str) -> str:
+    """Optional friendly label env var paired with a model/endpoint id."""
+    return f"{model_env}_DISPLAY"
+
+
+def provider_to_roster_fields(provider_id: str) -> dict[str, str | None]:
+    """Map ``provider_id`` to PlayerConfig LLM connection fields."""
+    spec = get_provider(provider_id)
+    fields: dict[str, str | None] = {
+        "base_url": spec.default_base_url,
+        "api_key_env": spec.api_key_env,
+    }
+    if spec.model_env:
+        fields["model_env"] = spec.model_env
+        fields["model"] = None
+    elif spec.default_model:
+        fields["model"] = spec.default_model
+        fields["model_env"] = None
+    return fields
+
+
+def is_provider_env_configured(
+    spec: ProviderSpec,
+    *,
+    environ: dict[str, str] | None = None,
+    on_disk: dict[str, str] | None = None,
+) -> bool:
+    """True when every required env field for the provider has a non-empty value."""
+    env = environ if environ is not None else os.environ
+    disk = on_disk or {}
+
+    def _value(env_name: str) -> str:
+        return (env.get(env_name) or disk.get(env_name) or "").strip()
+
+    for field in spec.env_fields:
+        if field.required and not _value(field.env_name):
+            return False
+    return True
+
+
+def resolve_model_display_name(
+    spec: ProviderSpec,
+    *,
+    environ: dict[str, str] | None = None,
+    on_disk: dict[str, str] | None = None,
+) -> str:
+    """Human-readable model label; never expose raw endpoint ids when DISPLAY is set."""
+    env = environ if environ is not None else os.environ
+    disk = on_disk or {}
+
+    def _value(env_name: str) -> str:
+        return (env.get(env_name) or disk.get(env_name) or "").strip()
+
+    if spec.model_env:
+        friendly = _value(model_display_env_name(spec.model_env))
+        if friendly:
+            return friendly
+        model_id = _value(spec.model_env)
+        if model_id and not model_id.startswith("ep-"):
+            return model_id
+    elif spec.default_model:
+        model_env = next(
+            (f.env_name for f in spec.env_fields if not f.secret and "MODEL" in f.env_name),
+            None,
+        )
+        if model_env:
+            friendly = _value(model_display_env_name(model_env))
+            if friendly:
+                return friendly
+        return spec.default_model
+    return spec.display_name

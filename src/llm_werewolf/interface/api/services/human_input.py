@@ -1,0 +1,221 @@
+"""Per-run broker that suspends a human seat's decision until the browser submits.
+
+Mirrors ``event_stream.py``: a small in-process registry keyed by ``run_id``.
+
+Flow:
+    * :class:`WebHumanAgent` calls :meth:`HumanInputBroker.request` from inside the
+      game's asyncio task. ``request`` registers an :class:`asyncio.Future`, pushes an
+      ``awaiting_input`` event through the broadcaster (visible only to the human's own
+      seat stream + god view), then ``await``\\s the future.
+    * The ``POST /games/{id}/input`` route calls :meth:`HumanInputBroker.submit` to
+      resolve that future. ``submit`` is idempotent: unknown / already-consumed
+      ``request_id`` returns ``False`` and never raises.
+    * If no submission arrives before ``deadline`` seconds, ``request`` falls back to a
+      safe value and emits ``input_timeout`` so the engine never deadlocks.
+
+``request_id`` is deterministic (``f"{run_id}-{seat}-{counter}"``) — no uuid / random —
+so tests can assert on it and so a replayed submit can be matched exactly.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+from dataclasses import dataclass
+
+
+@dataclass
+class PendingRequest:
+    """A single suspended human decision awaiting browser submission."""
+
+    request_id: str
+    seat: int
+    kind: str
+    future: "asyncio.Future[str]"
+    # The exact awaiting_input event payload published for this request (already
+    # including ``visible_to``). Cached so a late/reconnecting seat stream can re-emit
+    # the still-pending prompt verbatim (BUG#3). ``None`` only before it is built.
+    event: dict[str, Any] | None = None
+
+
+class HumanInputBroker:
+    """Suspend / resume one human seat's decisions for a single run."""
+
+    def __init__(self, run_id: str, seat: int, broadcaster: Any | None = None) -> None:
+        self.run_id = run_id
+        self.seat = seat
+        self._broadcaster = broadcaster
+        self._pending: dict[str, PendingRequest] = {}
+        self._counter = 0
+
+    # ------------------------------------------------------------------
+    # Suspend (called from the game task) / resume (called from HTTP)
+    # ------------------------------------------------------------------
+
+    async def request(
+        self,
+        *,
+        kind: str,
+        prompt: str,
+        valid_targets: list[int],
+        fallback: str,
+        deadline: float | None = None,
+        ui_hint: str = "",
+        title: str = "",
+        allow_skip: bool = False,
+        allow_witch_save: bool = True,
+        multi_count: int = 0,
+        self_role: str = "",
+        kill_target_seat: int | None = None,
+        remaining_potions: dict[str, bool] | None = None,
+        question: str = "",
+        target_meta: list[dict[str, object]] | None = None,
+    ) -> str:
+        """Register + publish ``awaiting_input`` + await the future.
+
+        Returns the normalized payload text from :meth:`submit`, or ``fallback`` on
+        timeout (also emitting ``input_timeout``). Never leaks the pending entry.
+        """
+        loop = asyncio.get_running_loop()
+        rid = f"{self.run_id}-{self.seat}-{self._counter}"
+        self._counter += 1
+        future: asyncio.Future[str] = loop.create_future()
+        pending = PendingRequest(
+            request_id=rid, seat=self.seat, kind=kind, future=future
+        )
+        self._pending[rid] = pending
+        self._publish_public(
+            {
+                "event_type": "actor_thinking",
+                "data": {
+                    "player_id": f"player_{self.seat}",
+                    "player_name": f"Player{self.seat}",
+                    "role": "",
+                    "context": _thinking_context_for_kind(kind),
+                },
+                "visible_to": None,
+            }
+        )
+        awaiting_event = {
+            "event_type": "awaiting_input",
+            "seat": self.seat,
+            "request_id": rid,
+            "kind": kind,
+            "prompt": prompt,
+            "valid_targets": list(valid_targets),
+            "deadline": deadline,
+            "ui_hint": ui_hint,
+            "title": title,
+            "allow_skip": allow_skip,
+            "allow_witch_save": allow_witch_save,
+            "multi_count": multi_count,
+            "self_role": self_role,
+            "kill_target_seat": kill_target_seat,
+            "remaining_potions": remaining_potions,
+            "question": question,
+            "target_meta": list(target_meta or []),
+            "visible_to": [f"player_{self.seat}"],
+        }
+        # Cache the seat-scoped payload so a late/reconnecting seat stream can re-emit
+        # this still-pending prompt verbatim (BUG#3). The payload already carries
+        # visible_to, so publish via _publish_public to avoid _publish re-stamping it.
+        pending.event = awaiting_event
+        self._publish_public(awaiting_event)
+        try:
+            return await asyncio.wait_for(future, deadline)
+        except asyncio.TimeoutError:
+            self._publish(
+                {
+                    "event_type": "input_timeout",
+                    "seat": self.seat,
+                    "request_id": rid,
+                    "kind": kind,
+                    "fallback": fallback,
+                }
+            )
+            return fallback
+        finally:
+            self._pending.pop(rid, None)
+
+    def submit(self, *, request_id: str, payload: str) -> bool:
+        """Resolve the matching future. Unknown / already-consumed -> ``False``."""
+        pending = self._pending.get(request_id)
+        if pending is None or pending.future.done():
+            return False
+        pending.future.set_result(payload)
+        self._publish(
+            {
+                "event_type": "input_received",
+                "seat": self.seat,
+                "request_id": request_id,
+            }
+        )
+        return True
+
+    def pending_ids(self) -> set[str]:
+        return set(self._pending)
+
+    def pending_events_for_seat(self, seat: int) -> list[dict[str, Any]]:
+        """Return the awaiting_input payload(s) currently outstanding for ``seat``.
+
+        Used by the seat SSE connect path to re-emit a still-pending prompt that was
+        published before this (re)connecting client subscribed (BUG#3). Only entries
+        whose future is unresolved are returned; the cached payload is the exact event
+        first published (seat-scoped via ``visible_to``), so re-emitting it is idempotent
+        — the client answers it with the same ``request_id``.
+        """
+        out: list[dict[str, Any]] = []
+        for pending in self._pending.values():
+            if pending.seat != seat or pending.event is None:
+                continue
+            if pending.future.done():
+                continue
+            out.append(pending.event)
+        return out
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _publish(self, event: dict[str, Any]) -> None:
+        if self._broadcaster is None:
+            return
+        # visible_to includes only this seat -> seat stream + god view see it;
+        # other seats never learn this player is being asked to act.
+        self._broadcaster.publish({**event, "visible_to": [f"player_{self.seat}"]})
+
+    def _publish_public(self, event: dict[str, Any]) -> None:
+        if self._broadcaster is None:
+            return
+        self._broadcaster.publish(event)
+
+
+def _thinking_context_for_kind(kind: str) -> str:
+    if kind == "speech":
+        return "day_speech"
+    if kind in {"witch", "seat", "multi"}:
+        return "night_skill"
+    if kind == "yesno":
+        return "sheriff_speech"
+    return "general"
+
+
+_registry: dict[str, HumanInputBroker] = {}
+
+
+def get_or_create_input_broker(
+    run_id: str, seat: int, broadcaster: Any | None = None
+) -> HumanInputBroker:
+    broker = _registry.get(run_id)
+    if broker is None:
+        broker = HumanInputBroker(run_id=run_id, seat=seat, broadcaster=broadcaster)
+        _registry[run_id] = broker
+    return broker
+
+
+def get_input_broker(run_id: str) -> HumanInputBroker | None:
+    return _registry.get(run_id)
+
+
+def remove_input_broker(run_id: str) -> None:
+    _registry.pop(run_id, None)

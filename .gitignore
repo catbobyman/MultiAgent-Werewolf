@@ -17,6 +17,9 @@ eggs/
 .eggs/
 lib/
 lib64/
+# Python "lib/" rule above unintentionally hides the frontend TS source dir; keep it tracked.
+!frontend/src/lib/
+!frontend/src/lib/**
 parts/
 sdist/
 var/
@@ -153,11 +156,22 @@ activemq-data/
 .envrc
 .venv
 eval_runs/
+artifacts/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Local secrets / scratch (never upload)
+API.txt
+_play/
+.tmp/
+
+# GitNexus code-intelligence artifacts (local tooling, not project source)
+AGENTS.md
+CLAUDE.md
+.claude/
 
 # Spyder project settings
 .spyderproject
@@ -218,8 +232,50 @@ __marimo__/
 .streamlit/secrets.toml
 
 /data/
+.reme/
+
+# Local-only: serialized AgentScope API calls (see docs/LOCAL_ONLY-serial-agent-calls.md)
+runs/
+runs_timing/
+
+# Local pytest / CI coverage artifacts (do not commit)
+.github/reports/
+
+# PostGame 草稿 Skill：仅 v1 初始库可提交；v2+ 不入库
+src/llm_werewolf/agent_team/skills/**/v[2-9]/**
+src/llm_werewolf/agent_team/skills/**/*.md
+!src/llm_werewolf/agent_team/skills/README.md
+!src/llm_werewolf/agent_team/skills/**/v1/*.md
 
 # Real API config files (keep example.yaml only)
 configs/xiaomi.yaml
 configs/test_real_llm.yaml
 configs/human_game.yaml
+
+# Local development files
+.claude/
+.kiro/
+.env.llmwerewolf
+*.pptx
+generate_ppt.py
+add_agentscope_slides.py
+
+# Local API keys — never commit
+Apikey.txt
+
+# Frontend (Node / Vite) — rules consolidated from frontend/.gitignore
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/coverage/
+frontend/.DS_Store
+frontend/*.log
+# Local frontend overrides only (default dev proxy is frontend/.env.development)
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+!frontend/.env.development
+
+# Editor / local scratch
+.cursor/
+conflict-files.txt

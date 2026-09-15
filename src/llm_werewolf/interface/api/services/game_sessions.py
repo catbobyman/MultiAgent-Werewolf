@@ -1,0 +1,775 @@
+"""In-process game session manager for web-triggered runs."""
+
+from __future__ import annotations
+
+import os
+from enum import Enum
+import json
+import zlib
+from typing import TYPE_CHECKING, Any
+import asyncio
+import logging
+from pathlib import Path
+from datetime import datetime
+import contextlib
+from dataclasses import field, dataclass
+
+from llm_werewolf.game_runtime import GameEngine
+from llm_werewolf.game_runtime.roles.catalog import ROLE_CATALOG
+from llm_werewolf.game_runtime.support.utils import load_config
+from llm_werewolf.interface.api.services.runs import get_run_detail
+from llm_werewolf.interface.api.models.actions import (
+    StartGameRequest,
+    StartGameResponse,
+    CancelGameResponse,
+    GameStatusResponse,
+    TriggerPostGameResponse,
+)
+from llm_werewolf.interface.api.services.replay import extract_game_snapshot
+from llm_werewolf.observability.core.dispatcher import get_dispatcher
+from llm_werewolf.observability.core.runtime_log import (
+    attach_run_log_handler,
+    detach_run_log_handler,
+)
+from llm_werewolf.interface.cli.runtime.bootstrap import (
+    prepare_game_roster,
+    create_information_hub,
+    wire_agentscope_after_setup,
+)
+from llm_werewolf.evaluation.post_game.event_adapter import event_to_dict
+from llm_werewolf.interface.api.services.human_input import (
+    remove_input_broker,
+    get_or_create_input_broker,
+)
+from llm_werewolf.interface.cli.runtime.finalize_run import finalize_run, persist_run_artifacts
+from llm_werewolf.interface.api.services.event_stream import (
+    remove_broadcaster,
+    get_or_create_broadcaster,
+)
+from llm_werewolf.evaluation.signals.post_game_signals import derive_post_game_status
+from llm_werewolf.interface.api.services.config_resolve import resolve_config_for_start
+from llm_werewolf.interface.api.services.human_input import (
+    remove_input_broker,
+    get_or_create_input_broker,
+)
+from llm_werewolf.interface.api.services.roster_customize import (
+    resolve_start_rules,
+    _rebuild_players_config,
+    has_roster_customizations,
+    prepare_start_players_config,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from llm_werewolf.game_runtime.config.player_config import PlayersConfig
+
+logger = logging.getLogger(__name__)
+
+# Web-human runs disable tight phase timeouts; broker deadline handles human wait.
+WEB_HUMAN_RELAXED_TIMEOUT_S = 3600
+
+
+def _read_run_meta(run_dir: Path) -> dict[str, Any]:
+    meta_path = run_dir / "run_meta.json"
+    if not meta_path.is_file():
+        return {}
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def read_web_human_auth(run_dir: Path) -> tuple[int | None, str | None]:
+    """Return ``(web_human_seat, player_token)`` persisted for a run, if any."""
+    meta = _read_run_meta(run_dir)
+    seat = meta.get("web_human_seat")
+    token = meta.get("player_token")
+    return (int(seat) if seat is not None else None, str(token) if token else None)
+
+
+def resolve_web_human_auth(
+    *,
+    run_dir: Path,
+    session: GameSession | None,
+) -> tuple[int | None, str | None]:
+    if session is not None and session.human_seat is not None:
+        return session.human_seat, session.player_token
+    return read_web_human_auth(run_dir)
+
+
+def validate_seat_stream_access(
+    *,
+    view: str,
+    seat: int | None,
+    token: str | None,
+    run_dir: Path,
+    session: GameSession | None,
+) -> str | None:
+    """Return an HTTP error detail string when seat-stream access must be denied."""
+    if view != "seat":
+        return None
+    web_seat, expected_token = resolve_web_human_auth(run_dir=run_dir, session=session)
+    if web_seat is None:
+        if seat is None:
+            return "seat query parameter is required for view=seat"
+        return None
+    if seat is None:
+        return "seat query parameter is required for web-human seat stream"
+    if token is None:
+        return "token query parameter is required for web-human seat stream"
+    if expected_token is None or token != expected_token:
+        return "Invalid seat token"
+    if seat != web_seat:
+        return "Seat does not match the human player seat for this run"
+    return None
+
+
+def build_run_id(
+    label: str,
+    ts: str,
+    *,
+    tag: str | None,
+    exists: Callable[[str], bool],
+) -> str:
+    """Build a unique run_id: ``{label}-{ts}[-{tag}]`` with a collision counter.
+
+    ``exists(run_id)`` reports whether a run dir of that id already exists. The
+    counter guarantees uniqueness across same-second opens (single backend) and
+    across backends sharing one runs dir (each backend passes a distinct ``tag``).
+    """
+    base = f"{label}-{ts}"
+    if tag:
+        base = f"{base}-{tag}"
+    if not exists(base):
+        return base
+    n = 2
+    while exists(f"{base}-{n}"):
+        n += 1
+    return f"{base}-{n}"
+
+
+def _read_alert_count(run_dir: Path) -> int:
+    report = run_dir / "alert_report.json"
+    if not report.is_file():
+        return 0
+    try:
+        payload = json.loads(report.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return 0
+    if isinstance(payload, dict):
+        return int(payload.get("alert_count") or 0)
+    return 0
+
+
+def _has_human_player(players_config: PlayersConfig) -> bool:
+    return any(player.model == "human" for player in players_config.players)
+
+
+def _override_seat_to_web_human(players_config: PlayersConfig, seat: int) -> PlayersConfig:
+    """Return a copy with ``seat`` (1-based) switched to the ``web-human`` builtin model.
+
+    Clears any LLM credentials (model_env/api_key_env/base_url) so the seat stays builtin
+    and no key is ever resolved or persisted for it.
+    """
+    roster = list(players_config.players)
+    index = seat - 1
+    if index < 0 or index >= len(roster):
+        msg = f"human seat {seat} is out of range for {len(roster)} players"
+        raise ValueError(msg)
+    roster[index] = roster[index].model_copy(
+        update={
+            "model": "web-human",
+            "model_env": None,
+            "api_key_env": None,
+            "base_url": None,
+        }
+    )
+    return _rebuild_players_config(players_config, roster)
+
+
+def _canonical_role_name(requested: str) -> str | None:
+    """Resolve a zh display name ('狼人') or English key ('Werewolf') to the catalog key.
+
+    Dealt role *instances* expose only the English ``name`` (their ``RoleConfig`` has
+    no display name); the zh display name lives in the catalog. Canonicalizing here
+    lets the human pick a role by its Chinese name and still match the dealt role.
+    """
+    req = requested.strip().lower()
+    if not req:
+        return None
+    for definition in ROLE_CATALOG:
+        if req in (str(definition.name).strip().lower(), str(definition.display_name).strip().lower()):
+            return definition.name
+    return None
+
+
+def _role_matches(role: object, requested: str) -> bool:
+    """True if ``role`` (a dealt role instance) is the requested role."""
+    target = _canonical_role_name(requested)
+    if target is None:
+        return False
+    get_config = getattr(role, "get_config", None)
+    cfg = get_config() if callable(get_config) else None
+    role_name = str(getattr(cfg, "name", "") or getattr(role, "name", "") or "")
+    # Normalize spaces: catalog keys are spaceless ("NightmareWolf") but dealt
+    # RoleConfig names are spaced ("Nightmare Wolf"); compare without spaces so
+    # multi-word roles (advanced wolves, GraveyardKeeper) match and the human's
+    # chosen role actually swaps in. (Without this, _force_human_seat_role finds
+    # no donor and silently keeps the random deal — a user-facing bug.)
+    return role_name.strip().lower().replace(" ", "") == target.lower().replace(" ", "")
+
+
+def _force_human_seat_role(engine: GameEngine, seat: int | None, requested: str | None) -> None:
+    """Make the human seat actually get the role the player picked.
+
+    ``setup_game`` shuffles roles across seats, so a chosen role would otherwise be
+    random. Swap the human seat's role with whichever seat holds the requested role
+    (the role multiset — and thus board balance — is preserved). Best-effort: if the
+    role isn't in the dealt lineup, keep the random deal and log; never break the run.
+    """
+    if seat is None or not requested:
+        return
+    game_state = getattr(engine, "game_state", None)
+    players = list(getattr(game_state, "players", []) or [])
+    if seat < 1 or seat > len(players):
+        return
+    human = players[seat - 1]
+    if _role_matches(human.role, requested):
+        return
+    donor = next((p for p in players if p is not human and _role_matches(p.role, requested)), None)
+    if donor is None:
+        logger.warning(
+            "Requested human role %r is not in the lineup for seat %d; keeping random deal",
+            requested,
+            seat,
+        )
+        return
+    donor_seat = players.index(donor) + 1
+    human.role, donor.role = donor.role, human.role
+    # Each role instance carries a ``self.player`` back-reference (set at construction)
+    # that the night layer uses to resolve the acting seat AND its agent
+    # (``role.player`` / ``role.player.agent`` in role_night_plans). Swapping the
+    # instances leaves those back-references crossed — which routed one role's prompt to
+    # the wrong seat's agent (e.g. a human who picked Seer got the LLM Witch's prompt via
+    # the human's broker). Re-point each instance at its new owner.
+    human.role.player = human
+    donor.role.player = donor
+    # Re-bind both agents to their new roles (setup_game bound them to the old ones).
+    for player, seat_number in ((human, seat), (donor, donor_seat)):
+        agent = getattr(player, "agent", None)
+        if agent is not None and hasattr(agent, "bind_role"):
+            agent.bind_role(type(player.role), seat_number=seat_number)
+
+
+def _write_god_roster(run_dir: Path, engine: object) -> None:
+    """Persist the god-view roster (seat -> role/camp/alive) for spectate.
+
+    Best-effort: never let roster I/O break a game run.
+    """
+    try:
+        players = list(getattr(getattr(engine, "game_state", None), "players", []) or [])
+        roster = []
+        for idx, p in enumerate(players, start=1):
+            role = getattr(p, "role", None)
+            cfg = role.get_config() if role is not None and hasattr(role, "get_config") else None
+            alive_attr = getattr(p, "is_alive", True)
+            is_alive = alive_attr() if callable(alive_attr) else alive_attr
+            roster.append({
+                "seat": idx,
+                "name": getattr(p, "name", f"Player{idx}"),
+                "role": getattr(cfg, "name", None) or getattr(role, "name", None) or "Unknown",
+                "camp": getattr(getattr(cfg, "camp", None), "value", None),
+                "is_alive": bool(is_alive),
+            })
+        (run_dir / "god_roster.json").write_text(
+            json.dumps(roster, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("Failed to write god_roster for %s: %s", run_dir.name, exc)
+
+
+class GameSessionStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    POST_GAME_FAILED = "post_game_failed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+def _derive_role_shuffle_seed(run_id: str) -> int:
+    """Stable per-run seed so web sessions remain reproducible."""
+    return zlib.adler32(run_id.encode("utf-8")) & 0x7FFFFFFF
+
+
+def _ensure_role_shuffle_seed(players_config: Any, *, run_id: str) -> Any:
+    if getattr(players_config, "role_shuffle_seed", None) is not None:
+        return players_config
+    return players_config.model_copy(update={"role_shuffle_seed": _derive_role_shuffle_seed(run_id)})
+
+
+@dataclass
+class GameSession:
+    run_id: str
+    run_dir: Path
+    config_path: Path
+    config_id: str
+    status: GameSessionStatus = GameSessionStatus.PENDING
+    task: asyncio.Task[Any] | None = None
+    error: str | None = None
+    result_text: str | None = None
+    started_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    completed_at: str | None = None
+    players_config: PlayersConfig | None = None
+    badge_flow: bool = False
+    participation: str | None = None
+    rules: str | None = None
+    human_seats: list[int] = field(default_factory=list)
+    post_game_status: str | None = None
+    alert_count: int = 0
+    broadcaster: Any | None = None
+    player_token: str | None = None
+    human_seat: int | None = None
+    human_role: str | None = None
+    input_broker: Any | None = None
+    track_vote_intentions: bool | None = None
+
+
+class IncrementalEventWriter:
+    """Append engine events to events.jsonl for live spectate polling."""
+
+    def __init__(self, run_dir: Path) -> None:
+        self._path = run_dir / "events.jsonl"
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def __call__(self, event: object) -> None:
+        with self._path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event_to_dict(event), ensure_ascii=False) + "\n")
+
+
+class GameSessionManager:
+    """Registry of background game runs started via HTTP POST."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, GameSession] = {}
+        self._lock = asyncio.Lock()
+
+    def reset(self) -> None:
+        self._sessions.clear()
+
+    async def start_game(
+        self,
+        *,
+        configs_dir: Path,
+        runs_dir: Path,
+        request: StartGameRequest,
+    ) -> StartGameResponse:
+        resolved = resolve_config_for_start(
+            configs_dir,
+            config_id=request.config_id,
+            config_path=request.config_path,
+            participation=request.participation,
+            rules=request.rules,
+        )
+        stem = resolved.stem
+        base_config = load_config(config_path=resolved)
+        participation, rules = resolve_start_rules(request)
+        players_config = prepare_start_players_config(base_config, request)
+        effective_players_config = players_config or base_config
+        if _has_human_player(effective_players_config):
+            msg = "Web human-player games are not supported yet; use the CLI werewolf command for human mixed games."
+            raise ValueError(msg)
+        human_seat: int | None = None
+        human_role: str | None = None
+        if request.human is not None:
+            human_seat = request.human.seat
+            human_role = request.human.role
+            # Override the requested seat to the builtin web-human model and persist the
+            # effective config so _run_game / launch_roster.json reflect it.
+            players_config = _override_seat_to_web_human(effective_players_config, human_seat)
+            effective_players_config = players_config
+        custom_roster = has_roster_customizations(request)
+        badge_flow = bool(request.badge_flow)
+        human_seats = list(request.human_seats or [])
+        effective_count = len(players_config.players) if players_config else len(base_config.players)
+
+        label = (request.run_label or stem).replace("llm-", "")
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        instance_tag = os.environ.get("WEREWOLF_INSTANCE_TAG") or None
+        run_id = build_run_id(
+            label, ts, tag=instance_tag, exists=lambda rid: (runs_dir / rid).exists()
+        )
+        run_dir = runs_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+
+        # Stable per-seat token (not auth): lets the browser claim the seat stream + /input.
+        player_token = f"seat{human_seat}-{run_id}" if human_seat is not None else None
+
+        # Stable per-seat token (not auth): lets the browser claim the seat stream + /input.
+        player_token = f"seat{human_seat}-{run_id}" if human_seat is not None else None
+
+        meta = {
+            "run_id": run_id,
+            "config_id": stem,
+            "config_path": str(resolved.as_posix()),
+            "status": GameSessionStatus.PENDING.value,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "participation": participation,
+            "rules": rules,
+            "custom_roster": custom_roster,
+            "player_count": effective_count,
+            "human_seats": human_seats,
+            "badge_flow": badge_flow,
+        }
+        if human_seat is not None:
+            meta["web_human_seat"] = human_seat
+            meta["player_token"] = player_token
+        (run_dir / "run_meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if players_config is not None:
+            (run_dir / "launch_roster.json").write_text(
+                json.dumps(
+                    players_config.model_dump(mode="json", exclude={"use_agentscope_backend"}),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+        session = GameSession(
+            run_id=run_id,
+            run_dir=run_dir,
+            config_path=resolved,
+            config_id=stem,
+            players_config=players_config,
+            badge_flow=badge_flow,
+            participation=participation,
+            rules=rules,
+            human_seats=human_seats,
+            human_seat=human_seat,
+            human_role=human_role,
+            player_token=player_token,
+            track_vote_intentions=request.track_vote_intentions,
+        )
+
+        async with self._lock:
+            self._sessions[run_id] = session
+
+        session.task = asyncio.create_task(
+            self._run_game(session),
+            name=f"game-session-{run_id}",
+        )
+        session.status = GameSessionStatus.RUNNING
+
+        amp = "&"
+        game_page_path = f"/game?run_id={run_id}{amp}source=runs"
+        seat_page_path = None
+        if human_seat is not None and player_token is not None:
+            seat_page_path = (
+                f"{game_page_path}{amp}view=seat{amp}seat={human_seat}"
+                f"{amp}token={player_token}"
+            )
+        return StartGameResponse(
+            run_id=run_id,
+            status=session.status.value,
+            config_id=stem,
+            run_dir=str(run_dir.as_posix()),
+            game_page_path=game_page_path,
+            status_path=f"/api/v1/games/{run_id}/status{amp}source=runs",
+            replay_page_path=f"/replay/{run_id}{amp}source=runs",
+            participation=participation,
+            rules=rules,
+            player_count=effective_count,
+            human_seats=human_seats,
+            badge_flow=badge_flow,
+            custom_roster=custom_roster,
+            player_token=player_token,
+            stream_path=f"/api/v1/games/{run_id}/stream" if human_seat is not None else None,
+        )
+
+    async def _run_game(self, session: GameSession) -> None:  # noqa: C901, PLR0915
+        attach_run_log_handler(session.run_dir)
+        try:
+            players_config = session.players_config or load_config(config_path=session.config_path)
+            players_config = _ensure_role_shuffle_seed(players_config, run_id=session.run_id)
+            session.players_config = players_config
+            players, roles, game_config = prepare_game_roster(players_config)
+            if session.badge_flow:
+                game_config = game_config.model_copy(update={"enable_sheriff": True})
+            if session.track_vote_intentions is not None:
+                game_config = game_config.model_copy(
+                    update={"track_vote_intentions": session.track_vote_intentions}
+                )
+            if session.human_seat is not None:
+                relaxed = WEB_HUMAN_RELAXED_TIMEOUT_S
+                game_config = game_config.model_copy(
+                    update={
+                        "night_timeout": relaxed,
+                        "day_timeout": relaxed,
+                        "vote_timeout": relaxed,
+                    }
+                )
+            engine = GameEngine(
+                game_config,
+                language=players_config.language,
+                information_hub=create_information_hub(),
+            )
+            writer = IncrementalEventWriter(session.run_dir)
+            broadcaster = get_or_create_broadcaster(session.run_id)
+            session.broadcaster = broadcaster
+
+            # Wire the web-human seat to its input broker (must run after the broadcaster
+            # exists so awaiting_input events can fan out to the seat stream).
+            if session.human_seat is not None:
+                broker = get_or_create_input_broker(
+                    session.run_id, session.human_seat, broadcaster
+                )
+                agent = players[session.human_seat - 1]
+                agent.seat = session.human_seat
+                agent.broker = broker
+                session.input_broker = broker
+
+            def _on_event(event: object) -> None:
+                writer(event)
+                broadcaster.publish(event_to_dict(event))
+
+            engine.on_event = _on_event
+            engine.setup_game(players=players, roles=roles)
+            # Honor the human's chosen role (setup_game shuffles, so without this swap
+            # the picked role would be random — the long-standing "选狼人却进成预言家" bug).
+            _force_human_seat_role(engine, session.human_seat, session.human_role)
+            _write_god_roster(session.run_dir, engine)
+            wire_agentscope_after_setup(engine, players_config)
+
+            result = await engine.play_game()
+            session.result_text = result
+            persist_run_artifacts(engine, session.run_dir)
+            post = await finalize_run(
+                engine,
+                session.run_dir,
+                game_result_text=result,
+                config_path=session.config_path,
+                prompt_version=players_config.prompt_version,
+            )
+            session.post_game_status = derive_post_game_status(
+                result_ok=post.ok,
+                error=post.error,
+                stage_errors=post.stage_errors or None,
+            )
+            session.alert_count = _read_alert_count(session.run_dir)
+            if post.error or session.post_game_status == "failed":
+                logger.warning("PostGame failed for %s: %s", session.run_id, post.error)
+                session.status = GameSessionStatus.POST_GAME_FAILED
+            else:
+                session.status = GameSessionStatus.COMPLETED
+        except asyncio.CancelledError:
+            session.status = GameSessionStatus.CANCELLED
+            session.error = "cancelled by client"
+            raise
+        except Exception as exc:
+            session.status = GameSessionStatus.FAILED
+            session.error = str(exc) or type(exc).__name__
+            logger.exception("Game session %s failed", session.run_id)
+            # Tell live SSE subscribers the game died so the UI can surface a clear
+            # "对局中断" state instead of silently freezing on the last phase (the
+            # sheriff-election screen). broadcaster.close() in `finally` only sends a
+            # generic end-of-stream, indistinguishable from a normal game end.
+            if session.broadcaster is not None:
+                try:
+                    session.broadcaster.publish({
+                        "event_type": "game_failed",
+                        "phase": "ended",
+                        "round_number": 0,
+                        "message": f"对局异常中断：{session.error}",
+                        "data": {"error": session.error},
+                        "visible_to": None,
+                    })
+                except Exception as pub_exc:
+                    logger.warning(
+                        "Failed to broadcast game_failed for %s: %s", session.run_id, pub_exc
+                    )
+            try:
+                await get_dispatcher().emit_session_failed(
+                    run_id=session.run_id,
+                    run_dir=session.run_dir,
+                    error=session.error,
+                )
+            except Exception as alert_exc:
+                logger.warning("Alert dispatch failed for %s: %s", session.run_id, alert_exc)
+        finally:
+            detach_run_log_handler(session.run_dir)
+            if session.broadcaster is not None:
+                session.broadcaster.close()
+            remove_broadcaster(session.run_id)
+            remove_input_broker(session.run_id)
+            session.completed_at = datetime.now().isoformat(timespec="seconds")
+            self._write_meta(session)
+
+    def _write_meta(self, session: GameSession) -> None:
+        meta_path = session.run_dir / "run_meta.json"
+        meta: dict[str, Any] = {}
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                meta = {}
+        meta.update(
+            {
+                "run_id": session.run_id,
+                "config_id": session.config_id,
+                "config_path": str(session.config_path.as_posix()),
+                "status": session.status.value,
+                "started_at": session.started_at,
+                "completed_at": session.completed_at,
+                "error": session.error,
+                "result_text": session.result_text,
+            }
+        )
+        if session.post_game_status is not None:
+            meta["post_game_status"] = session.post_game_status
+        if session.players_config is not None and session.players_config.role_shuffle_seed is not None:
+            meta["role_shuffle_seed"] = session.players_config.role_shuffle_seed
+        if session.alert_count:
+            meta["alert_count"] = session.alert_count
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def get_status(
+        self,
+        run_id: str,
+        *,
+        runs_dir: Path,
+        eval_runs_dir: Path,
+        source: str | None = None,
+    ) -> GameStatusResponse | None:
+        session = self._sessions.get(run_id)
+        run_dir: Path | None = None
+        if session is not None:
+            run_dir = session.run_dir
+            status = session.status.value
+            error = session.error
+            result_text = session.result_text
+            post_game_status = session.post_game_status
+            alert_count = session.alert_count
+        else:
+            detail = get_run_detail(run_id, runs_dir, eval_runs_dir, source=source or "runs")
+            if detail is None:
+                return None
+            run_dir = Path(detail.path)
+            meta_path = run_dir / "run_meta.json"
+            status = "completed"
+            error = None
+            result_text = detail.game_result_text
+            post_game_status = None
+            alert_count = None
+            if meta_path.is_file():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    status = str(meta.get("status") or status)
+                    error = meta.get("error")
+                    result_text = meta.get("result_text") or result_text
+                    post_game_status = meta.get("post_game_status")
+                    if meta.get("alert_count") is not None:
+                        alert_count = int(meta["alert_count"])
+                except json.JSONDecodeError:
+                    pass
+
+        snapshot = extract_game_snapshot(run_dir) if run_dir and run_dir.is_dir() else None
+        detail = get_run_detail(run_id, runs_dir, eval_runs_dir, source=source or "runs")
+        has_post_game = detail.has_post_game if detail else False
+        has_replay = detail.has_replay if detail else False
+
+        return GameStatusResponse(
+            run_id=run_id,
+            source=source or "runs",
+            status=status,
+            snapshot=snapshot,
+            error=error,
+            result_text=result_text,
+            has_post_game=has_post_game,
+            has_replay=has_replay,
+            post_game_status=post_game_status,
+            alert_count=alert_count,
+        )
+
+    async def cancel_game(self, run_id: str) -> CancelGameResponse | None:
+        session = self._sessions.get(run_id)
+        if session is None:
+            return None
+        if session.task and not session.task.done():
+            session.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session.task
+        if session.status not in {
+            GameSessionStatus.COMPLETED,
+            GameSessionStatus.POST_GAME_FAILED,
+            GameSessionStatus.FAILED,
+        }:
+            session.status = GameSessionStatus.CANCELLED
+            session.completed_at = datetime.now().isoformat(timespec="seconds")
+            self._write_meta(session)
+        return CancelGameResponse(
+            run_id=run_id,
+            status=session.status.value,
+            message="Game task cancelled",
+        )
+
+    async def trigger_post_game(
+        self,
+        run_id: str,
+        *,
+        runs_dir: Path,
+        eval_runs_dir: Path,
+        source: str | None = None,
+        force: bool = False,
+    ) -> TriggerPostGameResponse | None:
+        detail = get_run_detail(run_id, runs_dir, eval_runs_dir, source=source or "runs")
+        if detail is None:
+            return None
+        run_dir = Path(detail.path)
+        manifest = run_dir / "post_game_manifest.json"
+        if manifest.is_file() and not force:
+            return TriggerPostGameResponse(
+                run_id=run_id,
+                status="skipped",
+                message="PostGame artifacts already exist",
+                artifacts=[a.name for a in detail.artifacts],
+            )
+
+        events_path = run_dir / "events.jsonl"
+        if not events_path.is_file():
+            return TriggerPostGameResponse(
+                run_id=run_id,
+                status="failed",
+                message="events.jsonl not found; cannot run PostGame",
+                artifacts=[],
+            )
+
+        post = await finalize_run(
+            None,
+            run_dir,
+            game_result_text=detail.game_result_text,
+            config_path=None,
+        )
+        if post.error:
+            return TriggerPostGameResponse(
+                run_id=run_id,
+                status="failed",
+                message=post.error,
+                artifacts=post.artifacts,
+            )
+        return TriggerPostGameResponse(
+            run_id=run_id,
+            status="completed",
+            message="PostGame pipeline finished",
+            artifacts=post.artifacts,
+        )
+
+
+game_session_manager = GameSessionManager()

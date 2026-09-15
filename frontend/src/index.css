@@ -1,0 +1,293 @@
+@import "tailwindcss";
+@import '@fontsource/cinzel/700.css';
+@import '@fontsource/cinzel/900.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/800.css';
+/* 思源宋体（Noto Serif SC）— 全站中文正文 + 哥特展示标题用的宋体。
+   @fontsource 按 unicode-range 分片，浏览器只下载实际用到的字形子集。 */
+@import '@fontsource/noto-serif-sc/400.css';
+@import '@fontsource/noto-serif-sc/700.css';
+@import '@fontsource/noto-serif-sc/900.css';
+
+@theme {
+  --font-sans: "Noto Serif SC", ui-serif, "Georgia", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-serif: "Cinzel", "Times New Roman", serif;
+  --font-gothic: "UnifrakturMaguntia", cursive;
+  /* 中文哥特展示体：宋体重字重，用于面板标题/动作标签等。 */
+  --font-display-cn: "Noto Serif SC", "Songti SC", "SimSun", serif;
+}
+
+@utility font-gothic {
+  font-family: var(--font-gothic);
+}
+
+/* 宋体展示标题：宋体 + 重字重 + 字距 + 鎏金辉光（替代分散的 drop-shadow）。 */
+@utility font-display-cn {
+  font-family: var(--font-display-cn);
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-shadow:
+    0 0 12px rgba(212, 175, 55, 0.45),
+    1px 1px 2px rgba(0, 0, 0, 0.6);
+}
+
+html,
+body,
+#root {
+  font-family: var(--font-sans);
+}
+
+/* ═══════════════════════════════════════════════════════
+   右侧「存亡名录」名录列：粗罗马衬线统一。
+   data-roster-font 容器内所有文字——拉丁字符走 Cinzel 罗马体，
+   中文（标题等）自动落思源宋体兜底。仅改 font-family，
+   各元素自有的字重 / 鎏金辉光 / 颜色 / 字距一律不动。
+   选择器特异度 (0,1,1) 高于 Tailwind 的 font-mono/font-sans (0,1,0)，
+   故无需 !important 即可覆盖。SVG 图标与 emoji 不受 font-family 影响。
+   ═══════════════════════════════════════════════════════ */
+[data-roster-font] * {
+  font-family: "Cinzel", "Noto Serif SC", serif;
+}
+
+/* Sophisticated Dark Theme Specific classes */
+.manga-border { 
+  border: 4px solid #1e293b; 
+  box-shadow: 4px 4px 0px 0px rgba(59, 130, 246, 0.2); 
+  border-radius: 12px;
+}
+
+.ink-shadow { 
+  text-shadow: 2px 2px 0px rgba(15, 23, 42, 0.4); 
+}
+
+.bg-woodcut {
+  background-image: repeating-linear-gradient(
+    15deg, 
+    rgba(255, 255, 255, 0.04) 0px, 
+    rgba(255, 255, 255, 0.04) 1px, 
+    transparent 1px, 
+    transparent 6px
+  ),
+  repeating-linear-gradient(
+    -10deg, 
+    rgba(255, 255, 255, 0.02) 0px, 
+    rgba(255, 255, 255, 0.02) 1px, 
+    transparent 1px, 
+    transparent 10px
+  );
+}
+
+.bg-woodcut-dark {
+  background-image: repeating-linear-gradient(
+    25deg, 
+    rgba(0, 0, 0, 0.2) 0px, 
+    rgba(0, 0, 0, 0.2) 1px, 
+    transparent 1px, 
+    transparent 5px
+  ),
+  repeating-linear-gradient(
+    -15deg, 
+    rgba(0, 0, 0, 0.15) 0px, 
+    rgba(0, 0, 0, 0.15) 1px, 
+    transparent 1px, 
+    transparent 8px
+  );
+}
+
+.perspective-table { 
+  transform: perspective(800px) rotateX(60deg); 
+  background: radial-gradient(circle, rgba(147, 197, 253, 0.15) 0%, rgba(15, 23, 42, 0.8) 70%); 
+  border: 4px solid rgba(59, 130, 246, 0.3);
+  border-radius: 50%;
+  box-shadow: inset 0 0 50px rgba(59, 130, 246, 0.2), 0 20px 50px rgba(0,0,0,0.5);
+}
+
+.magic-circle { 
+  border: 2px dashed rgba(139, 92, 246, 0.5); 
+  box-shadow: 0 0 20px rgba(139, 92, 246, 0.3), inset 0 0 20px rgba(139, 92, 246, 0.3); 
+  border-radius: 50%;
+}
+
+.parchment { 
+  background-color: #f4ecd8;
+  background-image: 
+    radial-gradient(circle, transparent 20%, #e8dcc4 100%),
+    url("data:image/svg+xml,%3Csvg width='200' height='200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.05' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23noise)' opacity='0.08' mix-blend-mode='multiply'/%3E%3C/svg%3E");
+  color: #2c1a0b;
+  border-radius: 8px;
+  box-shadow: 
+    inset 0 0 40px rgba(139, 101, 8, 0.15),
+    inset 0 0 10px rgba(100, 70, 20, 0.2), 
+    4px 6px 12px rgba(0, 0, 0, 0.3);
+  position: relative;
+}
+
+.parchment::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: 
+    linear-gradient(90deg, rgba(200, 150, 100, 0.1) 0%, transparent 5%, transparent 95%, rgba(200, 150, 100, 0.1) 100%),
+    linear-gradient(0deg, rgba(150, 100, 50, 0.05) 0%, transparent 2%, transparent 98%, rgba(150, 100, 50, 0.05) 100%);
+  border-radius: inherit;
+}
+
+.stone-btn { 
+  background: linear-gradient(135deg, #3b82f6, #2563eb); 
+  border: 2px solid #1d4ed8; 
+  border-radius: 8px;
+  box-shadow: inset -2px -2px 0px rgba(0,0,0,0.2), inset 2px 2px 0px rgba(255,255,255,0.2); 
+  color: white;
+}
+
+.potion-btn { 
+  border-radius: 50% 50% 10% 10%; 
+  box-shadow: 0 0 15px currentColor; 
+}
+
+.tarot-card {
+  position: relative;
+  background-color: transparent;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(245, 158, 11, 0.15);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.tarot-card::before {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border: 1px solid rgba(245, 158, 11, 0.15);
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+/* Custom black engraving gothic scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #09090b;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 3px;
+  border: 1px solid #09090b;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* Hide scrollbar but keep scroll functionality */
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@keyframes spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin-slow {
+  animation: spin-slow 12s linear infinite;
+}
+
+/* ═══════════════════════════════════════════════════════
+   鎏金石雕按钮（琥珀-黑曜，雕刻立体感）— 顶栏 返回/主页/退出
+   纯外观：渐变金边 + 内凹石刻阴影 + 3px 投影；hover 描边变亮+辉光。
+   ═══════════════════════════════════════════════════════ */
+.gilt-btn {
+  position: relative;
+  overflow: hidden;
+}
+
+.gilt-btn::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    135deg,
+    rgba(212, 175, 55, 0.16) 0%,
+    transparent 45%,
+    rgba(0, 0, 0, 0.32) 100%
+  );
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+.gilt-btn:hover {
+  border-color: #f4d03f !important;
+  box-shadow:
+    inset 0 1px 2px rgba(255, 255, 255, 0.12),
+    inset -3px -3px 0 rgba(0, 0, 0, 0.85),
+    3px 3px 0 rgba(0, 0, 0, 0.55),
+    0 0 12px rgba(212, 175, 55, 0.3) !important;
+}
+
+.gilt-btn:active {
+  box-shadow:
+    inset 0 2px 5px rgba(0, 0, 0, 0.65),
+    inset 1px 1px 0 rgba(255, 255, 255, 0.05) !important;
+  transform: translateY(1px);
+}
+
+/* ═══════════════════════════════════════════════════════
+   中央牌框「...」呼吸灯 — 演员标签末尾的进行中指示点
+   三点错调淡入淡出 + 辉光；尊重 prefers-reduced-motion。
+   ═══════════════════════════════════════════════════════ */
+@keyframes breathing-dot-pulse {
+  0%, 100% {
+    opacity: 0.2;
+    transform: scale(0.78);
+    filter: drop-shadow(0 0 2px rgba(212, 175, 55, 0.3));
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+    filter: drop-shadow(0 0 7px rgba(212, 175, 55, 0.85));
+  }
+}
+
+.breathing-dots {
+  display: inline-flex;
+  gap: 0.28em;
+  align-items: center;
+  margin-left: 0.4em;
+  vertical-align: middle;
+}
+
+.breathing-dot {
+  width: 0.32em;
+  height: 0.32em;
+  border-radius: 50%;
+  background: currentColor;
+  animation: breathing-dot-pulse 1.4s ease-in-out infinite;
+  will-change: opacity, transform, filter;
+}
+
+.breathing-dot:nth-child(1) { animation-delay: 0s; }
+.breathing-dot:nth-child(2) { animation-delay: 0.32s; }
+.breathing-dot:nth-child(3) { animation-delay: 0.64s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .breathing-dot {
+    animation: none;
+    opacity: 0.6;
+  }
+}
