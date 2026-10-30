@@ -1,0 +1,4 @@
+{
+  "name": "MultiAgent-Werewolf",
+  "install": "bash /agent/repos/MultiAgent-Werewolf/.cursor/install.sh"
+}
